@@ -2365,7 +2365,7 @@ public class Socket: SocketReader, SocketWriter {
 		}
 		
 		// Read all available bytes...
-		let count = try self.readDataIntoStorage()
+		let (count, _) = try self.readDataIntoStorage()
 		
 		// Check for disconnect...
 		if count == 0 {
@@ -2441,7 +2441,7 @@ public class Socket: SocketReader, SocketWriter {
 		}
 		
 		// Read all available bytes...
-		let count = try self.readDataIntoStorage()
+		let (count, _) = try self.readDataIntoStorage()
 		
 		// Check for disconnect...
 		if count == 0 {
@@ -2485,7 +2485,7 @@ public class Socket: SocketReader, SocketWriter {
 		}
 		
 		// Read all available bytes...
-		let count = try self.readDataIntoStorage()
+		let (count, _) = try self.readDataIntoStorage()
 		
 		// Check for disconnect...
 		if count == 0 {
@@ -2793,7 +2793,26 @@ public class Socket: SocketReader, SocketWriter {
 			throw Error(code: Socket.SOCKET_ERR_WRONG_PROTOCOL, reason: "This is not a UDP socket.")
 		}
 
-		return 0
+		var addr = address.addr
+
+		#if os(Linux)
+			let s = Glibc.sendto(self.socketfd, buffer, bufSize, 0, &addr, socklen_t(address.size))
+		#else
+			let s = Darwin.sendto(self.socketfd, buffer, bufSize, 0, &addr, socklen_t(address.size))
+		#endif
+
+		if s <= 0 {
+
+			if errno == EAGAIN && !isBlocking {
+
+				// We have written out as much as we can...
+				return s
+			}
+
+			throw Error(code: Socket.SOCKET_ERR_WRITE_FAILED, reason: self.lastError())
+		}
+
+		return s
 	}
 
 	///
@@ -2943,13 +2962,17 @@ public class Socket: SocketReader, SocketWriter {
 	///
 	/// - Returns: number of bytes read.
 	///
-	private func readDataIntoStorage() throws -> Int {
+	private func readDataIntoStorage() throws -> (bytesRead: Int, address: Address?) {
 		
 		// Clear the buffer...
 		self.readBuffer.deinitialize()
 		self.readBuffer.initialize(to: 0x0)
 		memset(self.readBuffer, 0x0, self.readBufferSize)
-		
+
+		guard let sig = self.signature else {
+			throw Error(code: Socket.SOCKET_ERR_INTERNAL, reason: "Could not find signature")
+		}
+
 		// Read all the available data...
 		var count: Int = 0
 		repeat {
@@ -3010,7 +3033,7 @@ public class Socket: SocketReader, SocketWriter {
 				//		it means there was NO data to read...
 				if errno == EAGAIN || errno == EWOULDBLOCK {
 					
-					return 0
+					return (0, nil)
 				}
 				
 				// - Handle a connection reset by peer (ECONNRESET) and throw a different exception...
@@ -3026,7 +3049,7 @@ public class Socket: SocketReader, SocketWriter {
 			if count == 0 {
 				
 				self.remoteConnectionClosed = true
-				return 0
+				return (0, nil)
 			}
 			
 			if count > 0 {
@@ -3039,9 +3062,9 @@ public class Socket: SocketReader, SocketWriter {
 				break
 			}
 			
-		} while count > 0
+		} while count > 0 && sig.proto != .udp
 		
-		return self.readStorage.length
+		return (self.readStorage.length, nil)
 	}
 	
 	///
