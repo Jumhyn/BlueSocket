@@ -1114,6 +1114,7 @@ class SocketTests: XCTestCase {
 		("testBlocking", testBlocking),
 		("testIsReadableWritable", testIsReadableWritable),
 		("testReadWrite", testReadWrite),
+		("testReadWriteUDP", testReadWriteUDP),
 		("testReadWriteUnix", testReadWriteUnix),
 	]
 }
