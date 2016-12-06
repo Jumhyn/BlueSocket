@@ -302,6 +302,55 @@ public class Socket: SocketReader, SocketWriter {
 		
 		/// sockaddr_un
 		case unix(sockaddr_un)
+
+		init?(addr: sockaddr_storage) {
+			switch Int32(addr.ss_family) {
+			case AF_INET:
+				self = .ipv4(addr.asIPV4())
+			case AF_INET6:
+				self = .ipv6(addr.asIPV6())
+			case AF_UNIX:
+				self = .unix(addr.asUnix())
+			default:
+				return nil
+			}
+		}
+
+		init?(host: String, port: Int32) {
+			var info: UnsafeMutablePointer<addrinfo>? = UnsafeMutablePointer<addrinfo>.allocate(capacity: 1)
+
+			// Retrieve the info on our target...
+			var status: Int32 = getaddrinfo(host, String(port), nil, &info)
+			if status != 0 {
+
+				return nil
+			}
+
+			// Defer cleanup of our target info...
+			defer {
+
+				if info != nil {
+					freeaddrinfo(info)
+				}
+			}
+
+			var address: Address
+			if info!.pointee.ai_family == Int32(AF_INET) {
+
+				var addr = sockaddr_in()
+				memcpy(&addr, info!.pointee.ai_addr, Int(MemoryLayout<sockaddr_in>.size))
+				address = .ipv4(addr)
+
+			} else if info!.pointee.ai_family == Int32(AF_INET6) {
+
+				var addr = sockaddr_in6()
+				memcpy(&addr, info!.pointee.ai_addr, Int(MemoryLayout<sockaddr_in6>.size))
+				address = .ipv6(addr)
+			} else {
+				return nil
+			}
+			self = address
+		}
 		
 		///
 		/// Size of address. (Readonly)
@@ -2545,8 +2594,24 @@ public class Socket: SocketReader, SocketWriter {
 				
 				throw Error(code: Socket.SOCKET_ERR_WRONG_PROTOCOL, reason: "This is not a UDP socket.")
 		}
-		
-		return (0, nil)
+
+		let (count, address) = try self.readDataIntoStorage()
+
+		if bufSize < self.readStorage.length {
+
+			// Nope, throw an exception telling the caller how big the buffer must be...
+			throw Error(bufferSize: self.readStorage.length)
+		}
+
+		if bufSize > 0 {
+			// - We've read data, copy to the callers buffer...
+			memcpy(buffer, self.readStorage.bytes, self.readStorage.length)
+		}
+
+		// - Reset the storage buffer...
+		self.readStorage.length = 0
+
+		return (count, address)
 	}
 	
 	///
@@ -2572,8 +2637,20 @@ public class Socket: SocketReader, SocketWriter {
 			
 			throw Error(code: Socket.SOCKET_ERR_WRONG_PROTOCOL, reason: "This is not a UDP socket.")
 		}
+
+		// Read all available data...
+		let (count, address) = try self.readDataIntoStorage()
+
+		// Did we get data?
+		if count > 0 {
+
+			data.append(self.readStorage.bytes, length: self.readStorage.length)
+		}
+
+		// - Reset the storage buffer...
+		self.readStorage.length = 0
 		
-		return (0, nil)
+		return (count, address)
 	}
 	
 	///
@@ -2599,8 +2676,22 @@ public class Socket: SocketReader, SocketWriter {
 				
 				throw Error(code: Socket.SOCKET_ERR_WRONG_PROTOCOL, reason: "This is not a UDP socket.")
 		}
-		
-		return (0, nil)
+
+		// Read all available bytes...
+		let (count, address) = try self.readDataIntoStorage()
+
+		// Did we get data?
+		if count > 0 {
+
+			// - Yes, move to caller's buffer...
+			data.append(self.readStorage.bytes.assumingMemoryBound(to: UInt8.self), count: self.readStorage.length)
+
+		}
+
+		// - Reset the storage buffer...
+		self.readStorage.length = 0
+
+		return (count, address)
 	}
 	
 	// MARK: -- Write
@@ -2970,7 +3061,22 @@ public class Socket: SocketReader, SocketWriter {
 		memset(self.readBuffer, 0x0, self.readBufferSize)
 
 		guard let sig = self.signature else {
-			throw Error(code: Socket.SOCKET_ERR_INTERNAL, reason: "Could not find signature")
+			throw Error(code: Socket.SOCKET_ERR_INTERNAL, reason: "Socket signature not found.")
+		}
+
+		var storagePtr: UnsafeMutablePointer<sockaddr_storage>?
+		var len: socklen_t
+		if sig.proto == .udp {
+			storagePtr = UnsafeMutablePointer<sockaddr_storage>.allocate(capacity: 1)
+			len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+		} else {
+			storagePtr = nil
+			len = 0
+		}
+
+		var addrPtr: UnsafeMutablePointer<sockaddr>? = nil
+		storagePtr?.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+			addrPtr = $0
 		}
 
 		// Read all the available data...
@@ -3020,9 +3126,9 @@ public class Socket: SocketReader, SocketWriter {
 				
 			} else {
 				#if os(Linux)
-					count = Glibc.recv(self.socketfd, self.readBuffer, self.readBufferSize, 0)
+					count = Glibc.recvfrom(self.socketfd, self.readBuffer, self.readBufferSize, 0)
 				#else
-					count = Darwin.recv(self.socketfd, self.readBuffer, self.readBufferSize, 0)
+					count = Darwin.recvfrom(self.socketfd, self.readBuffer, self.readBufferSize, 0, addrPtr, &len)
 				#endif
 			}
 			
@@ -3046,7 +3152,7 @@ public class Socket: SocketReader, SocketWriter {
 				throw Error(code: Socket.SOCKET_ERR_RECV_FAILED, reason: self.lastError())
 			}
 			
-			if count == 0 {
+			if count == 0 && sig.proto != .udp {
 				
 				self.remoteConnectionClosed = true
 				return (0, nil)
@@ -3063,7 +3169,11 @@ public class Socket: SocketReader, SocketWriter {
 			}
 			
 		} while count > 0 && sig.proto != .udp
-		
+
+		if let addr = storagePtr?.pointee {
+			return (self.readStorage.length, Address(addr: addr))
+		}
+
 		return (self.readStorage.length, nil)
 	}
 	
